@@ -1,4 +1,5 @@
 <?php
+require_once __DIR__ . '/../mail.php';
 /* CU-01 Iniciar sesión, CU-02 Recuperar contraseña, CU-07 Autorregistro de paciente */
 
 function auth_login(): void {
@@ -54,16 +55,19 @@ function auth_register(): void {
 function auth_forgot(): void {
     $mail = strtolower(str(body(), 'correo', 120));
     if (!valid_email($mail)) fail('Ingrese un correo válido', 422);
+    // Respuesta neutra: no revela si el correo existe
     $out = ['mensaje' => 'Si el correo está registrado, recibirá un enlace para restablecer su contraseña.'];
-    $st = db()->prepare('SELECT id_usuario FROM usuarios WHERE lower(correo) = ? AND estado'); $st->execute([$mail]);
+    $st = db()->prepare('SELECT id_usuario, nombre_completo FROM usuarios WHERE lower(correo) = ? AND estado'); $st->execute([$mail]);
     if ($u = $st->fetch()) {
         $token = bin2hex(random_bytes(32));
         db()->prepare("INSERT INTO tokens_recuperacion(id_usuario, token_hash, expira_en) VALUES (?, ?, now() + interval '30 minutes')")
             ->execute([$u['id_usuario'], hash('sha256', $token)]);
-        $front = rtrim(explode(',', env('ALLOWED_ORIGINS', 'http://localhost:5173'))[0], '/');
+        $front = rtrim(env('FRONTEND_URL') ?: explode(',', env('ALLOWED_ORIGINS', 'http://localhost:5173'))[0], '/');
         $link = "$front/#/reset?token=$token";
-        // Aquí se enviaría el correo (SMTP). En modo demostración (APP_DEBUG=1) el enlace se devuelve en la respuesta.
-        if (env('APP_DEBUG') === '1') $out['enlace_demo'] = $link; else error_log("Recuperación solicitada para usuario {$u['id_usuario']}");
+        [$html, $txt] = correo_recuperacion($u['nombre_completo'], $link);
+        $enviado = enviar_correo($mail, $u['nombre_completo'], 'Restablecer su contraseña — Clínica Vida Salud', $html, $txt);
+        // Sólo en modo demostración y si el correo NO pudo enviarse, se muestra el enlace en pantalla
+        if (!$enviado && env('APP_DEBUG') === '1') $out['enlace_demo'] = $link;
     }
     json_out($out);
 }
