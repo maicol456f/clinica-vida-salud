@@ -1,0 +1,665 @@
+diff --git a/README.md b/README.md
+index ea5e179..eaa9c8c 100644
+--- a/README.md
++++ b/README.md
+@@ -44,3 +44,12 @@ Defina `SEED_DEMO=0` para cargar sólo el administrador (clave en `ADMIN_PASSWOR
+ Contraseñas con `password_hash`, token firmado con expiración, consultas parametrizadas (PDO), validación en cliente y servidor,
+ escape de salida contra XSS, control de acceso por rol, errores sin detalles internos, CORS restringido (`ALLOWED_ORIGINS`),
+ y prevención de citas superpuestas con validación en servidor + transacción + restricción `EXCLUDE` de PostgreSQL.
++
++## Bitácora general y bloqueo por intentos fallidos
++**Bloqueo de cuenta.** Tras `MAX_INTENTOS` (3) contraseñas incorrectas consecutivas la cuenta queda bloqueada y responde `423`. Un ingreso correcto reinicia el contador.
++Se desbloquea desde *Usuarios y roles → Desbloquear* (administrador), o cuando el usuario restablece su contraseña por correo.
++Con `LOCKOUT_MINUTES` mayor que 0 el bloqueo se levanta solo pasado ese tiempo (0 = sólo manual). Rescate por consola: `php scripts/desbloquear.php admin`.
++
++**Bitácora.** Tabla `bitacora` de sólo inserción (un trigger impide modificarla o borrarla). Registra inicio y cierre de sesión, intentos fallidos, bloqueos,
++recuperación de contraseña y las altas/cambios de usuarios, especialidades, médicos, horarios, pacientes y citas, con usuario, rol, IP, detalle y resultado.
++Pantalla *Bitácora* (sólo administrador) con filtros, paginación y exportación a CSV. La migración `sql/bitacora_bloqueo.sql` es idempotente y corre en cada arranque.
+diff --git a/backend/.env.example b/backend/.env.example
+index 31a0938..b5020d9 100644
+--- a/backend/.env.example
++++ b/backend/.env.example
+@@ -14,4 +14,10 @@ DB_PASSWORD=postgres
+ # DATABASE_URL=postgres://usuario:clave@host:5432/base
+ 
+ ADMIN_PASSWORD=Admin123!
++
++# Bloqueo por intentos fallidos de inicio de sesión
++MAX_INTENTOS=3
++# 0 = la cuenta queda bloqueada hasta que un administrador la desbloquee (o el usuario recupere su contraseña por correo)
++# N > 0 = se desbloquea sola pasados N minutos
++LOCKOUT_MINUTES=0
+ SEED_DEMO=1
+diff --git a/backend/public/index.php b/backend/public/index.php
+index 3fd7fd1..979fac1 100644
+--- a/backend/public/index.php
++++ b/backend/public/index.php
+@@ -2,7 +2,7 @@
+ declare(strict_types=1);
+ require __DIR__ . '/../src/core.php';
+ load_env(__DIR__ . '/../.env');
+-foreach (['auth', 'admin', 'pacientes', 'citas'] as $c) require __DIR__ . "/../src/controllers/$c.php";
++foreach (['auth', 'admin', 'pacientes', 'citas', 'bitacora'] as $c) require __DIR__ . "/../src/controllers/$c.php";
+ 
+ cors();
+ 
+@@ -17,11 +17,15 @@ route('POST', '/api/auth/login', 'auth_login');
+ route('POST', '/api/auth/register', 'auth_register');
+ route('POST', '/api/auth/forgot', 'auth_forgot');
+ route('POST', '/api/auth/reset', 'auth_reset');
++route('POST', '/api/auth/logout', 'auth_logout');
+ route('GET', '/api/me', 'auth_me');
+ route('GET', '/api/roles', 'roles_list');
+ route('GET', '/api/usuarios', 'usuarios_list');
+ route('POST', '/api/usuarios', fn() => usuarios_save());
+ route('PUT', '/api/usuarios/{id}', 'usuarios_save');
++route('POST', '/api/usuarios/{id}/desbloquear', 'usuarios_desbloquear');
++route('GET', '/api/bitacora', 'bitacora_list');
++route('GET', '/api/bitacora/exportar', 'bitacora_exportar');
+ route('GET', '/api/especialidades', 'especialidades_list');
+ route('POST', '/api/especialidades', fn() => especialidades_save());
+ route('PUT', '/api/especialidades/{id}', 'especialidades_save');
+diff --git a/backend/scripts/desbloquear.php b/backend/scripts/desbloquear.php
+new file mode 100644
+index 0000000..a733fd8
+--- /dev/null
++++ b/backend/scripts/desbloquear.php
+@@ -0,0 +1,13 @@
++<?php
++// Desbloquea una cuenta por consola (por si queda bloqueado el único administrador).
++// Uso:  php scripts/desbloquear.php admin
++require __DIR__ . '/../src/core.php';
++load_env(__DIR__ . '/../.env');
++$user = $argv[1] ?? '';
++if ($user === '') { fwrite(STDERR, "Uso: php scripts/desbloquear.php <usuario>\n"); exit(1); }
++$st = db()->prepare('SELECT id_usuario FROM usuarios WHERE lower(username) = lower(?)');
++$st->execute([$user]); $id = $st->fetchColumn();
++if ($id === false) { fwrite(STDERR, "No existe el usuario «{$user}».\n"); exit(1); }
++$nombre = desbloquear_cuenta((int)$id);
++bitacora('Usuarios', 'USUARIO_DESBLOQUEADO', "Desbloqueó la cuenta «{$nombre}» por consola", ['username' => 'consola']);
++echo "Cuenta «{$nombre}» desbloqueada.\n";
+diff --git a/backend/scripts/setup.php b/backend/scripts/setup.php
+index 97aa48c..2f8d419 100644
+--- a/backend/scripts/setup.php
++++ b/backend/scripts/setup.php
+@@ -8,6 +8,8 @@ if (!$pdo->query("SELECT to_regclass('public.roles')")->fetchColumn()) {
+     echo "Creando esquema de base de datos...\n";
+     $pdo->exec(file_get_contents(__DIR__ . '/../sql/schema.sql'));
+ }
++// Migraciones idempotentes (bitácora y bloqueo por intentos): corren en cada arranque, también en bases ya existentes
++$pdo->exec(file_get_contents(__DIR__ . '/../sql/bitacora_bloqueo.sql'));
+ if ((int)$pdo->query('SELECT count(*) FROM roles')->fetchColumn() > 0) { echo "Base de datos lista.\n"; exit(0); }
+ 
+ echo "Cargando datos iniciales...\n";
+diff --git a/backend/sql/bitacora_bloqueo.sql b/backend/sql/bitacora_bloqueo.sql
+new file mode 100644
+index 0000000..5de3b28
+--- /dev/null
++++ b/backend/sql/bitacora_bloqueo.sql
+@@ -0,0 +1,36 @@
++-- =====================================================================
++-- Migración idempotente: bitácora general + bloqueo por intentos fallidos
++-- Se ejecuta en cada arranque desde scripts/setup.php (se puede repetir sin riesgo).
++-- =====================================================================
++
++-- 1) Bloqueo de cuentas tras N intentos fallidos consecutivos
++ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS intentos_fallidos INT       NOT NULL DEFAULT 0;
++ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS bloqueado         BOOLEAN   NOT NULL DEFAULT FALSE;
++ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS bloqueado_en      TIMESTAMP;
++
++-- 2) Bitácora general del sistema (auditoría)
++CREATE TABLE IF NOT EXISTS bitacora (
++    id_bitacora  BIGSERIAL    PRIMARY KEY,
++    fecha_hora   TIMESTAMP    NOT NULL DEFAULT now(),
++    id_usuario   INT,                              -- sin FK: el registro se conserva aunque cambie el usuario
++    usuario      VARCHAR(120),                     -- nombre de usuario (o lo que se digitó en un login fallido)
++    rol          VARCHAR(30),
++    modulo       VARCHAR(30)  NOT NULL,            -- Sesión, Usuarios, Pacientes, Citas...
++    accion       VARCHAR(40)  NOT NULL,            -- LOGIN_OK, LOGIN_FALLIDO, CITA_CREADA...
++    detalle      VARCHAR(500),
++    resultado    VARCHAR(10)  NOT NULL DEFAULT 'OK' CHECK (resultado IN ('OK', 'FALLIDO')),
++    ip           VARCHAR(64)
++);
++CREATE INDEX IF NOT EXISTS idx_bitacora_fecha   ON bitacora(fecha_hora DESC);
++CREATE INDEX IF NOT EXISTS idx_bitacora_usuario ON bitacora(id_usuario);
++CREATE INDEX IF NOT EXISTS idx_bitacora_modulo  ON bitacora(modulo, accion);
++
++-- 3) La bitácora es de sólo inserción: nadie puede editar ni borrar registros
++CREATE OR REPLACE FUNCTION fn_bitacora_inmutable() RETURNS trigger AS $$
++BEGIN
++    RAISE EXCEPTION 'La bitácora es de sólo lectura: no se puede modificar ni eliminar';
++END;
++$$ LANGUAGE plpgsql;
++DROP TRIGGER IF EXISTS trg_bitacora_inmutable ON bitacora;
++CREATE TRIGGER trg_bitacora_inmutable BEFORE UPDATE OR DELETE ON bitacora
++FOR EACH ROW EXECUTE FUNCTION fn_bitacora_inmutable();
+diff --git a/backend/src/controllers/admin.php b/backend/src/controllers/admin.php
+index 7b5cd5a..4288fe3 100644
+--- a/backend/src/controllers/admin.php
++++ b/backend/src/controllers/admin.php
+@@ -6,11 +6,11 @@ function roles_list(): void { require_login(); json_out(db()->query('SELECT id_r
+ /* ---------- CU-03 ---------- */
+ function usuarios_list(): void {
+     require_role('Administrador');
+-    json_out(db()->query('SELECT u.id_usuario, u.nombre_completo, u.username, u.correo, u.estado, u.id_rol, r.nombre AS rol, u.creado_en
++    json_out(db()->query('SELECT u.id_usuario, u.nombre_completo, u.username, u.correo, u.estado, u.bloqueado, u.intentos_fallidos, u.id_rol, r.nombre AS rol, u.creado_en
+         FROM usuarios u JOIN roles r ON r.id_rol = u.id_rol ORDER BY u.id_usuario')->fetchAll());
+ }
+ function usuarios_save(int $id = 0): void {
+-    require_role('Administrador'); $b = body();
++    $adm = require_role('Administrador'); $b = body();
+     need($b, ['nombre_completo' => 'Nombre completo', 'username' => 'Usuario', 'correo' => 'Correo', 'id_rol' => 'Rol']);
+     $nombre = str($b, 'nombre_completo', 120); $user = str($b, 'username', 40); $mail = strtolower(str($b, 'correo', 120));
+     $rol = (int)$b['id_rol']; $estado = pgb($b['estado'] ?? true); $pw = (string)($b['password'] ?? '');
+@@ -19,12 +19,13 @@ function usuarios_save(int $id = 0): void {
+     if ($id === 0 && !valid_password($pw)) fail('La contraseña inicial debe tener al menos 8 caracteres, con letras y números', 422);
+     if ($id > 0 && $pw !== '' && !valid_password($pw)) fail('La contraseña debe tener al menos 8 caracteres, con letras y números', 422);
+     $pdo = db();
+-    $c = $pdo->prepare('SELECT 1 FROM roles WHERE id_rol = ?'); $c->execute([$rol]); if (!$c->fetch()) fail('El rol no existe', 422);
++    $c = $pdo->prepare('SELECT nombre FROM roles WHERE id_rol = ?'); $c->execute([$rol]); $rolNombre = $c->fetchColumn(); if ($rolNombre === false) fail('El rol no existe', 422);
+     $c = $pdo->prepare('SELECT 1 FROM usuarios WHERE (lower(username) = lower(?) OR lower(correo) = ?) AND id_usuario <> ?'); $c->execute([$user, $mail, $id]);
+     if ($c->fetch()) fail('El nombre de usuario o el correo ya existen', 409);
+     if ($id === 0) {
+         $pdo->prepare('INSERT INTO usuarios(id_rol, nombre_completo, username, correo, password_hash, estado) VALUES (?,?,?,?,?,?::boolean)')
+             ->execute([$rol, $nombre, $user, $mail, password_hash($pw, PASSWORD_DEFAULT), $estado]);
++        bitacora('Usuarios', 'USUARIO_CREADO', "Creó el usuario «{$user}» con rol $rolNombre", $adm);
+         json_out(['mensaje' => 'Usuario creado'], 201);
+     }
+     $c = $pdo->prepare("SELECT u.estado, r.nombre AS rol FROM usuarios u JOIN roles r ON r.id_rol = u.id_rol WHERE u.id_usuario = ?"); $c->execute([$id]);
+@@ -37,9 +38,19 @@ function usuarios_save(int $id = 0): void {
+     $pdo->prepare('UPDATE usuarios SET id_rol = ?, nombre_completo = ?, username = ?, correo = ?, estado = ?::boolean WHERE id_usuario = ?')
+         ->execute([$rol, $nombre, $user, $mail, $estado, $id]);
+     if ($pw !== '') $pdo->prepare('UPDATE usuarios SET password_hash = ? WHERE id_usuario = ?')->execute([password_hash($pw, PASSWORD_DEFAULT), $id]);
++    bitacora('Usuarios', 'USUARIO_ACTUALIZADO', "Actualizó el usuario «{$user}» (rol $rolNombre, " . ($estado === 'true' ? 'activo' : 'inactivo') . ')' . ($pw !== '' ? ', cambió su contraseña' : ''), $adm);
+     json_out(['mensaje' => 'Usuario actualizado']);
+ }
+ 
++/** El administrador levanta el bloqueo por intentos fallidos de una cuenta. */
++function usuarios_desbloquear(int $id): void {
++    $adm = require_role('Administrador');
++    $nombre = desbloquear_cuenta($id);
++    if ($nombre === null) fail('El usuario no existe', 404);
++    bitacora('Usuarios', 'USUARIO_DESBLOQUEADO', "Desbloqueó la cuenta «{$nombre}»", $adm);
++    json_out(['mensaje' => 'Cuenta desbloqueada']);
++}
++
+ /* ---------- CU-04 ---------- */
+ function especialidades_list(): void {
+     require_login();
+@@ -49,7 +60,7 @@ function especialidades_list(): void {
+         FROM especialidades e $w ORDER BY e.nombre")->fetchAll());
+ }
+ function especialidades_save(int $id = 0): void {
+-    require_role('Administrador'); $b = body();
++    $adm = require_role('Administrador'); $b = body();
+     need($b, ['nombre' => 'Nombre']);
+     $nombre = str($b, 'nombre', 80); $desc = str($b, 'descripcion', 200); $estado = pgb($b['estado'] ?? true); $norm = normalizar($nombre);
+     $pdo = db();
+@@ -57,6 +68,7 @@ function especialidades_save(int $id = 0): void {
+     if ($c->fetch()) fail('Ya existe una especialidad con ese nombre', 409);
+     if ($id === 0) {
+         $pdo->prepare('INSERT INTO especialidades(nombre, nombre_normalizado, descripcion, estado) VALUES (?,?,?,?::boolean)')->execute([$nombre, $norm, $desc ?: null, $estado]);
++        bitacora('Especialidades', 'ESPECIALIDAD_CREADA', "Creó la especialidad «{$nombre}»", $adm);
+         json_out(['mensaje' => 'Especialidad creada'], 201);
+     }
+     if ($estado === 'false' && empty($b['confirmar'])) {
+@@ -66,6 +78,7 @@ function especialidades_save(int $id = 0): void {
+     $u = $pdo->prepare('UPDATE especialidades SET nombre = ?, nombre_normalizado = ?, descripcion = ?, estado = ?::boolean WHERE id_especialidad = ?');
+     $u->execute([$nombre, $norm, $desc ?: null, $estado, $id]);
+     if (!$u->rowCount()) fail('La especialidad no existe', 404);
++    bitacora('Especialidades', 'ESPECIALIDAD_ACTUALIZADA', "Actualizó la especialidad «{$nombre}» (" . ($estado === 'true' ? 'activa' : 'inactiva') . ')', $adm);
+     json_out(['mensaje' => 'Especialidad actualizada']);
+ }
+ 
+@@ -93,7 +106,7 @@ function medicos_list(): void {
+     json_out($rows);
+ }
+ function medicos_save(int $id = 0): void {
+-    require_role('Administrador'); $b = body();
++    $adm = require_role('Administrador'); $b = body(); $esNuevo = $id === 0;
+     need($b, ['nro_registro' => 'Nro. de registro profesional', 'nombres' => 'Nombres', 'apellidos' => 'Apellidos', 'correo' => 'Correo']);
+     $reg = str($b, 'nro_registro', 30); $no = str($b, 'nombres', 80); $ap = str($b, 'apellidos', 80); $tel = str($b, 'telefono', 20);
+     $mail = strtolower(str($b, 'correo', 120)); $estado = pgb($b['estado'] ?? true);
+@@ -131,6 +144,7 @@ function medicos_save(int $id = 0): void {
+         }
+         foreach ($esps as $e) $pdo->prepare('INSERT INTO medico_especialidad(id_medico, id_especialidad) VALUES (?,?)')->execute([$id, $e]);
+     });
++    bitacora('Médicos', $esNuevo ? 'MEDICO_CREADO' : 'MEDICO_ACTUALIZADO', ($esNuevo ? 'Registró' : 'Actualizó') . " al médico $no $ap (registro $reg)", $adm);
+     json_out(['mensaje' => 'Médico guardado'], 201);
+ }
+ 
+@@ -147,7 +161,7 @@ function horario_conflicto(int $medico, int $dia, string $ini, string $fin, int
+     $st->execute([$medico, $dia, $fin, $ini, $excluir]); return (bool)$st->fetch();
+ }
+ function horarios_create(): void {
+-    require_role('Administrador'); $b = body();
++    $adm = require_role('Administrador'); $b = body();
+     need($b, ['id_medico' => 'Médico', 'dia_semana' => 'Día', 'hora_inicio' => 'Hora inicial', 'hora_fin' => 'Hora final', 'duracion_min' => 'Duración']);
+     $m = (int)$b['id_medico']; $dia = (int)$b['dia_semana']; $ini = str($b, 'hora_inicio', 8); $fin = str($b, 'hora_fin', 8); $dur = (int)$b['duracion_min'];
+     if ($dia < 1 || $dia > 7) fail('Día inválido', 422);
+@@ -160,14 +174,16 @@ function horarios_create(): void {
+     if (horario_conflicto($m, $dia, $ini, $fin)) fail('El horario se superpone con otro ya registrado para ese día', 409);
+     db()->prepare('INSERT INTO horarios_atencion(id_medico, dia_semana, hora_inicio, hora_fin, duracion_min) VALUES (?,?,?::time,?::time,?)')->execute([$m, $dia, $ini, $fin, $dur]);
+     $cupos = intdiv((strtotime($fin) - strtotime($ini)) / 60, $dur);
++    bitacora('Horarios', 'HORARIO_CREADO', "Médico #$m: " . ['', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo'][$dia] . " de $ini a $fin, $dur min por cita", $adm);
+     json_out(['mensaje' => "Horario guardado: $cupos cupos por jornada"], 201);
+ }
+ function horarios_estado(int $id): void {
+-    require_role('Administrador'); $estado = pgb(body()['estado'] ?? false);
++    $adm = require_role('Administrador'); $estado = pgb(body()['estado'] ?? false);
+     $st = db()->prepare('SELECT * FROM horarios_atencion WHERE id_horario = ?'); $st->execute([$id]); $h = $st->fetch();
+     if (!$h) fail('El horario no existe', 404);
+     if ($estado === 'true' && horario_conflicto((int)$h['id_medico'], (int)$h['dia_semana'], $h['hora_inicio'], $h['hora_fin'], $id))
+         fail('No se puede reactivar: se superpone con otro horario vigente', 409);
+     db()->prepare('UPDATE horarios_atencion SET estado = ?::boolean WHERE id_horario = ?')->execute([$estado, $id]);
++    bitacora('Horarios', $estado === 'true' ? 'HORARIO_ACTIVADO' : 'HORARIO_DESACTIVADO', "Horario #$id del médico #{$h['id_medico']} " . ($estado === 'true' ? 'activado' : 'desactivado'), $adm);
+     json_out(['mensaje' => 'Horario actualizado']);
+ }
+diff --git a/backend/src/controllers/auth.php b/backend/src/controllers/auth.php
+index 6047643..98ae4a4 100644
+--- a/backend/src/controllers/auth.php
++++ b/backend/src/controllers/auth.php
+@@ -5,14 +5,71 @@ require_once __DIR__ . '/../mail.php';
+ function auth_login(): void {
+     $b = body(); $id = str($b, 'identificador', 120); $pw = (string)($b['password'] ?? '');
+     if ($id === '' || $pw === '') fail('Ingrese usuario o correo y contraseña', 422);
+-    $st = db()->prepare('SELECT u.id_usuario, u.password_hash, u.estado, r.nombre AS rol FROM usuarios u
++    $pdo = db();
++    $st = $pdo->prepare('SELECT u.id_usuario, u.username, u.password_hash, u.estado, u.bloqueado, u.intentos_fallidos, r.nombre AS rol FROM usuarios u
+         JOIN roles r ON r.id_rol = u.id_rol WHERE lower(u.username) = lower(?) OR lower(u.correo) = lower(?) LIMIT 1');
+     $st->execute([$id, $id]); $u = $st->fetch();
+-    if (!$u || !password_verify($pw, $u['password_hash'])) fail('Usuario o contraseña incorrectos', 401);
+-    if (!$u['estado']) fail('La cuenta está inactiva. Comuníquese con la clínica.', 403);
++    if (!$u) {
++        bitacora('Sesión', 'LOGIN_FALLIDO', "Usuario o correo inexistente: $id", ['username' => $id], 'FALLIDO');
++        fail('Usuario o contraseña incorrectos', 401);
++    }
++    $actor = ['id_usuario' => (int)$u['id_usuario'], 'username' => $u['username'], 'rol' => $u['rol']];
++    $max = max_intentos(); $min = minutos_bloqueo();
++    $msgBloqueo = fn(int $restan) => $min > 0
++        ? "La cuenta está bloqueada por exceso de intentos fallidos. Intente de nuevo en $restan minuto(s) o recupere su contraseña por correo."
++        : 'La cuenta está bloqueada por exceso de intentos fallidos. Recupere su contraseña por correo o comuníquese con el administrador.';
++
++    /* 1) Cuenta ya bloqueada: ni siquiera se verifica la contraseña */
++    if ($u['bloqueado']) {
++        $restan = 0;
++        if ($min > 0) {   // bloqueo temporal: puede haber vencido
++            $q = $pdo->prepare('SELECT GREATEST(0, ceil(extract(epoch FROM (bloqueado_en + make_interval(mins => ?::int) - now())) / 60))::int FROM usuarios WHERE id_usuario = ?');
++            $q->execute([$min, $u['id_usuario']]); $restan = (int)$q->fetchColumn();
++            if ($restan === 0) {
++                desbloquear_cuenta((int)$u['id_usuario']);
++                bitacora('Sesión', 'CUENTA_DESBLOQUEADA', 'Venció el bloqueo temporal (desbloqueo automático)', $actor);
++                $u['bloqueado'] = false; $u['intentos_fallidos'] = 0;
++            }
++        }
++        if ($u['bloqueado']) {
++            bitacora('Sesión', 'LOGIN_BLOQUEADO', 'Intento de ingreso con la cuenta bloqueada', $actor, 'FALLIDO');
++            fail($msgBloqueo($restan), 423);
++        }
++    }
++
++    /* 2) Contraseña incorrecta: suma un intento (atómico) y bloquea al llegar al máximo */
++    if (!password_verify($pw, $u['password_hash'])) {
++        $q = $pdo->prepare('UPDATE usuarios SET intentos_fallidos = intentos_fallidos + 1,
++            bloqueado = (intentos_fallidos + 1 >= ?::int),
++            bloqueado_en = CASE WHEN intentos_fallidos + 1 >= ?::int THEN now() ELSE bloqueado_en END
++            WHERE id_usuario = ? RETURNING intentos_fallidos, bloqueado');
++        $q->execute([$max, $max, $u['id_usuario']]); $r = $q->fetch();
++        $n = (int)$r['intentos_fallidos'];
++        bitacora('Sesión', 'LOGIN_FALLIDO', "Contraseña incorrecta (intento $n de $max)", $actor, 'FALLIDO');
++        if ($r['bloqueado']) {
++            bitacora('Sesión', 'CUENTA_BLOQUEADA', "Cuenta bloqueada tras $max intentos fallidos consecutivos", $actor, 'FALLIDO');
++            fail($msgBloqueo($min), 423);
++        }
++        $quedan = $max - $n;
++        fail("Usuario o contraseña incorrectos. Le quedan $quedan intento(s) antes de bloquear la cuenta.", 401);
++    }
++
++    /* 3) Contraseña correcta */
++    if (!$u['estado']) {
++        bitacora('Sesión', 'LOGIN_FALLIDO', 'Cuenta inactiva', $actor, 'FALLIDO');
++        fail('La cuenta está inactiva. Comuníquese con la clínica.', 403);
++    }
++    if ((int)$u['intentos_fallidos'] > 0) $pdo->prepare('UPDATE usuarios SET intentos_fallidos = 0 WHERE id_usuario = ?')->execute([$u['id_usuario']]);
++    bitacora('Sesión', 'LOGIN_OK', 'Inicio de sesión exitoso', $actor);
+     json_out(['token' => make_token((int)$u['id_usuario'], $u['rol']), 'user' => load_user((int)$u['id_usuario'])]);
+ }
+ 
++function auth_logout(): void {
++    $u = require_login();
++    bitacora('Sesión', 'LOGOUT', 'Cierre de sesión', $u);
++    json_out(['ok' => true]);
++}
++
+ function auth_me(): void { json_out(['user' => require_login()]); }
+ 
+ /** Valida y limpia los datos de un paciente (usado por autorregistro, recepción y edición). */
+@@ -49,6 +106,7 @@ function auth_register(): void {
+             $d['telefono'], $d['correo'], $d['direccion'] ?: null, $uid]);
+         return $uid;
+     });
++    bitacora('Sesión', 'REGISTRO_PACIENTE', "Autorregistro de paciente (CI {$d['ci']})", ['id_usuario' => $uid, 'username' => $d['ci'], 'rol' => 'Paciente']);
+     json_out(['token' => make_token($uid, 'Paciente'), 'user' => load_user($uid)], 201);
+ }
+ 
+@@ -57,8 +115,10 @@ function auth_forgot(): void {
+     if (!valid_email($mail)) fail('Ingrese un correo válido', 422);
+     // Respuesta neutra: no revela si el correo existe
+     $out = ['mensaje' => 'Si el correo está registrado, recibirá un enlace para restablecer su contraseña.'];
+-    $st = db()->prepare('SELECT id_usuario, nombre_completo FROM usuarios WHERE lower(correo) = ? AND estado'); $st->execute([$mail]);
+-    if ($u = $st->fetch()) {
++    $st = db()->prepare('SELECT id_usuario, username, nombre_completo FROM usuarios WHERE lower(correo) = ? AND estado'); $st->execute([$mail]);
++    $u = $st->fetch();
++    if (!$u) bitacora('Sesión', 'RECUPERACION_SOLICITADA', "Correo no registrado o cuenta inactiva: $mail", ['username' => $mail], 'FALLIDO');
++    if ($u) {
+         $token = bin2hex(random_bytes(32));
+         db()->prepare("INSERT INTO tokens_recuperacion(id_usuario, token_hash, expira_en) VALUES (?, ?, now() + interval '30 minutes')")
+             ->execute([$u['id_usuario'], hash('sha256', $token)]);
+@@ -67,6 +127,8 @@ function auth_forgot(): void {
+         [$html, $txt] = correo_recuperacion($u['nombre_completo'], $link);
+         $enviado = enviar_correo($mail, $u['nombre_completo'], 'Restablecer su contraseña — Clínica Vida Salud', $html, $txt);
+         // Sólo en modo demostración y si el correo NO pudo enviarse, se muestra el enlace en pantalla
++        bitacora('Sesión', 'RECUPERACION_SOLICITADA', 'Solicitud de enlace de recuperación (correo ' . ($enviado ? 'enviado' : 'NO enviado') . ')',
++            ['id_usuario' => (int)$u['id_usuario'], 'username' => $u['username']], $enviado ? 'OK' : 'FALLIDO');
+         if (!$enviado && env('APP_DEBUG') === '1') $out['enlace_demo'] = $link;
+     }
+     json_out($out);
+@@ -75,12 +137,22 @@ function auth_forgot(): void {
+ function auth_reset(): void {
+     $b = body(); $token = str($b, 'token', 100); $pw = (string)($b['password'] ?? '');
+     if (!valid_password($pw)) fail('La contraseña debe tener al menos 8 caracteres, con letras y números', 422);
+-    tx(function (PDO $pdo) use ($token, $pw) {
+-        $st = $pdo->prepare('SELECT id_token, id_usuario FROM tokens_recuperacion WHERE token_hash = ? AND NOT usado AND expira_en > now() FOR UPDATE');
+-        $st->execute([hash('sha256', $token)]); $t = $st->fetch();
+-        if (!$t) fail('El enlace no es válido, expiró o ya fue utilizado', 422);
+-        $pdo->prepare('UPDATE usuarios SET password_hash = ? WHERE id_usuario = ?')->execute([password_hash($pw, PASSWORD_DEFAULT), $t['id_usuario']]);
+-        $pdo->prepare('UPDATE tokens_recuperacion SET usado = true WHERE id_token = ?')->execute([$t['id_token']]);
+-    });
++    try {
++        $uid = tx(function (PDO $pdo) use ($token, $pw) {
++            $st = $pdo->prepare('SELECT id_token, id_usuario FROM tokens_recuperacion WHERE token_hash = ? AND NOT usado AND expira_en > now() FOR UPDATE');
++            $st->execute([hash('sha256', $token)]); $t = $st->fetch();
++            if (!$t) fail('El enlace no es válido, expiró o ya fue utilizado', 422);
++            // Restablecer la contraseña por correo también levanta el bloqueo por intentos fallidos
++            $pdo->prepare('UPDATE usuarios SET password_hash = ?, bloqueado = false, intentos_fallidos = 0, bloqueado_en = NULL WHERE id_usuario = ?')
++                ->execute([password_hash($pw, PASSWORD_DEFAULT), $t['id_usuario']]);
++            $pdo->prepare('UPDATE tokens_recuperacion SET usado = true WHERE id_token = ?')->execute([$t['id_token']]);
++            return (int)$t['id_usuario'];
++        });
++    } catch (HttpError $e) {
++        bitacora('Sesión', 'RECUPERACION_FALLIDA', $e->getMessage(), null, 'FALLIDO');
++        throw $e;
++    }
++    $u = load_user($uid);
++    bitacora('Sesión', 'RECUPERACION_COMPLETADA', 'Contraseña restablecida con enlace de correo (cuenta desbloqueada)', ['id_usuario' => $uid, 'username' => $u['username'] ?? null, 'rol' => $u['rol'] ?? null]);
+     json_out(['mensaje' => 'Contraseña actualizada. Ya puede iniciar sesión.']);
+ }
+diff --git a/backend/src/controllers/bitacora.php b/backend/src/controllers/bitacora.php
+new file mode 100644
+index 0000000..086135c
+--- /dev/null
++++ b/backend/src/controllers/bitacora.php
+@@ -0,0 +1,44 @@
++<?php
++/* Bitácora general: consulta y exportación (sólo Administrador). Los registros son inmutables (trigger en la BD). */
++
++function bitacora_filtros(): array {
++    $w = []; $p = [];
++    if (($q = str($_GET, 'q', 80)) !== '') {
++        $w[] = '(b.usuario ILIKE ? OR b.accion ILIKE ? OR b.detalle ILIKE ? OR b.ip ILIKE ?)';
++        array_push($p, "%$q%", "%$q%", "%$q%", "%$q%");
++    }
++    if (($m = str($_GET, 'modulo', 30)) !== '') { $w[] = 'b.modulo = ?'; $p[] = $m; }
++    if (in_array($r = str($_GET, 'resultado', 10), ['OK', 'FALLIDO'], true)) { $w[] = 'b.resultado = ?'; $p[] = $r; }
++    if (($d = str($_GET, 'desde', 10)) !== '' && valid_date($d)) { $w[] = 'b.fecha_hora >= ?::date'; $p[] = $d; }
++    if (($h = str($_GET, 'hasta', 10)) !== '' && valid_date($h)) { $w[] = 'b.fecha_hora < (?::date + 1)'; $p[] = $h; }
++    return [$w ? ' WHERE ' . implode(' AND ', $w) : '', $p];
++}
++
++function bitacora_list(): void {
++    require_role('Administrador');
++    [$where, $p] = bitacora_filtros();
++    $limite = min(100, max(10, (int)($_GET['limite'] ?? 25))); $pagina = max(1, (int)($_GET['pagina'] ?? 1));
++    $st = db()->prepare('SELECT count(*) FROM bitacora b' . $where); $st->execute($p); $total = (int)$st->fetchColumn();
++    $paginas = max(1, (int)ceil($total / $limite)); $pagina = min($pagina, $paginas);
++    $st = db()->prepare("SELECT b.id_bitacora, b.fecha_hora, b.usuario, b.rol, b.modulo, b.accion, b.detalle, b.resultado, b.ip
++        FROM bitacora b $where ORDER BY b.id_bitacora DESC LIMIT $limite OFFSET " . (($pagina - 1) * $limite));
++    $st->execute($p);
++    json_out(['total' => $total, 'pagina' => $pagina, 'paginas' => $paginas, 'items' => $st->fetchAll()]);
++}
++
++/** CSV (separador «;» para que Excel en español lo abra en columnas). Máximo 5000 filas con los filtros actuales. */
++function bitacora_exportar(): void {
++    $adm = require_role('Administrador');
++    [$where, $p] = bitacora_filtros();
++    $st = db()->prepare("SELECT b.fecha_hora, b.usuario, b.rol, b.modulo, b.accion, b.detalle, b.resultado, b.ip
++        FROM bitacora b $where ORDER BY b.id_bitacora DESC LIMIT 5000");
++    $st->execute($p); $rows = $st->fetchAll();
++    bitacora('Bitácora', 'BITACORA_EXPORTADA', 'Exportó ' . count($rows) . ' registros a CSV', $adm);
++    header('Content-Type: text/csv; charset=utf-8');
++    header('Content-Disposition: attachment; filename="bitacora.csv"');
++    $safe = fn($v) => (is_string($v) && $v !== '' && strpos("=+-@\t\r", $v[0]) !== false) ? "'" . $v : $v;   // evita inyección de fórmulas en Excel
++    $out = fopen('php://output', 'w'); fwrite($out, "\xEF\xBB\xBF");
++    fputcsv($out, ['Fecha y hora', 'Usuario', 'Rol', 'Módulo', 'Acción', 'Detalle', 'Resultado', 'IP'], ';', '"', '');
++    foreach ($rows as $r) fputcsv($out, array_map($safe, array_values($r)), ';', '"', '');
++    fclose($out);
++}
+diff --git a/backend/src/controllers/citas.php b/backend/src/controllers/citas.php
+index aa4abbc..6c687d2 100644
+--- a/backend/src/controllers/citas.php
++++ b/backend/src/controllers/citas.php
+@@ -69,7 +69,9 @@ function citas_create(): void {
+         return $st->fetchColumn();
+     });
+     $st = db()->prepare(CITA_SQL . ' WHERE c.codigo = ?'); $st->execute([$codigo]);
+-    json_out($st->fetch(), 201);
++    $cita = $st->fetch();
++    bitacora('Citas', 'CITA_CREADA', "Cita $codigo programada para $f $h con {$cita['medico']} (paciente {$cita['paciente_codigo']})", $u);
++    json_out($cita, 201);
+ }
+ 
+ function cita_autorizada(int $id): array {
+@@ -104,6 +106,7 @@ function citas_reprogramar(int $id): void {
+             ->execute([$id, $c['estado'], $c['estado'], $u['id_usuario'], $obs]);
+         return cita_row($id);
+     });
++    bitacora('Citas', 'CITA_REPROGRAMADA', "Cita {$res['codigo']} reprogramada a $f $h" . ($motivo ? ": $motivo" : ''), $u);
+     json_out($res);
+ }
+ 
+@@ -122,5 +125,6 @@ function citas_cancelar(int $id): void {
+         $pdo->prepare('UPDATE cita_historial SET id_usuario = ? WHERE id_historial = (SELECT max(id_historial) FROM cita_historial WHERE id_cita = ?)')->execute([$u['id_usuario'], $id]);
+         return cita_row($id);
+     });
++    bitacora('Citas', 'CITA_CANCELADA', "Cita {$res['codigo']} cancelada. Motivo: $motivo", $u);
+     json_out($res);
+ }
+diff --git a/backend/src/controllers/pacientes.php b/backend/src/controllers/pacientes.php
+index b89adfb..20b0a0d 100644
+--- a/backend/src/controllers/pacientes.php
++++ b/backend/src/controllers/pacientes.php
+@@ -13,24 +13,28 @@ function pacientes_list(): void {
+     $st->execute($p); json_out($st->fetchAll());
+ }
+ function pacientes_save(int $id = 0): void {
+-    require_role('Administrador', 'Recepcionista'); $d = validar_paciente(body()); $pdo = db();
++    $u = require_role('Administrador', 'Recepcionista'); $d = validar_paciente(body()); $pdo = db();
+     $c = $pdo->prepare('SELECT 1 FROM pacientes WHERE ci = ? AND id_paciente <> ?'); $c->execute([$d['ci'], $id]);
+     if ($c->fetch()) fail('Ya existe un paciente con ese CI', 409);
+     $v = [$d['ci'], $d['nombres'], $d['apellidos'], $d['fecha_nacimiento'], $d['sexo'], $d['telefono'], $d['correo'] ?: null, $d['direccion'] ?: null];
+     if ($id === 0) {
+         $st = $pdo->prepare('INSERT INTO pacientes(ci, nombres, apellidos, fecha_nacimiento, sexo, telefono, correo, direccion) VALUES (?,?,?,?,?,?,?,?) RETURNING codigo');
+-        $st->execute($v); json_out(['mensaje' => 'Paciente registrado', 'codigo' => $st->fetchColumn()], 201);
++        $st->execute($v); $cod = $st->fetchColumn();
++        bitacora('Pacientes', 'PACIENTE_REGISTRADO', "Registró al paciente $cod (CI {$d['ci']})", $u);
++        json_out(['mensaje' => 'Paciente registrado', 'codigo' => $cod], 201);
+     }
+     $v[] = $id;
+     $st = $pdo->prepare('UPDATE pacientes SET ci=?, nombres=?, apellidos=?, fecha_nacimiento=?::date, sexo=?, telefono=?, correo=?, direccion=? WHERE id_paciente=?');
+     $st->execute($v);
+     if (!$st->rowCount()) fail('El paciente no existe', 404);
++    bitacora('Pacientes', 'PACIENTE_ACTUALIZADO', "Modificó los datos del paciente CI {$d['ci']}", $u);
+     json_out(['mensaje' => 'Paciente actualizado']);
+ }
+ /** RN11: los pacientes no se eliminan, sólo se activan o desactivan. */
+ function pacientes_estado(int $id): void {
+-    require_role('Administrador', 'Recepcionista');
+-    $st = db()->prepare('UPDATE pacientes SET estado = ?::boolean WHERE id_paciente = ?'); $st->execute([pgb(body()['estado'] ?? false), $id]);
+-    if (!$st->rowCount()) fail('El paciente no existe', 404);
++    $u = require_role('Administrador', 'Recepcionista'); $nuevo = pgb(body()['estado'] ?? false);
++    $st = db()->prepare('UPDATE pacientes SET estado = ?::boolean WHERE id_paciente = ? RETURNING codigo'); $st->execute([$nuevo, $id]);
++    $cod = $st->fetchColumn(); if ($cod === false) fail('El paciente no existe', 404);
++    bitacora('Pacientes', $nuevo === 'true' ? 'PACIENTE_ACTIVADO' : 'PACIENTE_DESACTIVADO', "Paciente $cod " . ($nuevo === 'true' ? 'activado' : 'desactivado'), $u);
+     json_out(['mensaje' => 'Estado actualizado']);
+ }
+diff --git a/backend/src/core.php b/backend/src/core.php
+index a159ca8..87307ea 100644
+--- a/backend/src/core.php
++++ b/backend/src/core.php
+@@ -70,7 +70,7 @@ function str(array $a, string $k, int $max = 200): string {
+ }
+ function need(array $a, array $labels): void {
+     foreach ($labels as $k => $label) if (!isset($a[$k]) || (is_scalar($a[$k]) && trim((string)$a[$k]) === ''))
+-        fail("El campo «$label» es obligatorio", 422);
++        fail("El campo «{$label}» es obligatorio", 422);
+ }
+ 
+ /* ---------- Validaciones (servidor) ---------- */
+@@ -130,6 +130,31 @@ function require_role(string ...$roles): array {
+     return $u;
+ }
+ 
++/* ---------- Bitácora general ---------- */
++/** Registra un evento. $actor = ['id_usuario' =>, 'username' =>, 'rol' =>] (todo opcional). Nunca interrumpe la operación principal. */
++function bitacora(string $modulo, string $accion, string $detalle = '', ?array $actor = null, string $resultado = 'OK'): void {
++    try {
++        $xff = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? '';   // en Render la IP real llega en este encabezado
++        $ip = $xff !== '' ? trim(explode(',', $xff)[0]) : ($_SERVER['REMOTE_ADDR'] ?? '');
++        $nombre = $actor['username'] ?? null;
++        db()->prepare('INSERT INTO bitacora(id_usuario, usuario, rol, modulo, accion, detalle, resultado, ip) VALUES (?,?,?,?,?,?,?,?)')->execute([
++            $actor['id_usuario'] ?? null, $nombre !== null ? mb_substr((string)$nombre, 0, 120) : null, $actor['rol'] ?? null,
++            $modulo, $accion, $detalle !== '' ? mb_substr($detalle, 0, 500) : null, $resultado, $ip !== '' ? mb_substr($ip, 0, 64) : null,
++        ]);
++    } catch (Throwable $e) { error_log('Bitácora: ' . $e->getMessage()); }
++}
++
++/* ---------- Bloqueo por intentos fallidos ---------- */
++function max_intentos(): int { return max(1, (int)env('MAX_INTENTOS', '3')); }
++/** 0 = el bloqueo dura hasta que un administrador (o la recuperación de contraseña) lo levante. */
++function minutos_bloqueo(): int { return max(0, (int)env('LOCKOUT_MINUTES', '0')); }
++/** Quita el bloqueo y reinicia el contador. Devuelve el username, o null si el usuario no existe. */
++function desbloquear_cuenta(int $id): ?string {
++    $st = db()->prepare('UPDATE usuarios SET bloqueado = false, intentos_fallidos = 0, bloqueado_en = NULL WHERE id_usuario = ? RETURNING username');
++    $st->execute([$id]); $n = $st->fetchColumn();
++    return $n === false ? null : (string)$n;
++}
++
+ /* ---------- CORS ---------- */
+ function cors(): void {
+     header('X-Content-Type-Options: nosniff');
+diff --git a/frontend/js/api.js b/frontend/js/api.js
+index 01aef79..2ebd237 100644
+--- a/frontend/js/api.js
++++ b/frontend/js/api.js
+@@ -1,5 +1,16 @@
+ const TOKEN_KEY = 'vs_token';
+-function logout() { sessionStorage.removeItem(TOKEN_KEY); location.hash = '#/login'; location.reload(); }
++async function logout() {
++  const t = sessionStorage.getItem(TOKEN_KEY);
++  if (t) {   // avisa al servidor para registrar el cierre en la bitácora (máx. 1,5 s de espera)
++    try {
++      await Promise.race([
++        fetch(window.APP_CONFIG.API_URL + '/api/auth/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + t } }).catch(() => {}),
++        new Promise(r => setTimeout(r, 1500))
++      ]);
++    } catch { /* se cierra la sesión igualmente */ }
++  }
++  sessionStorage.removeItem(TOKEN_KEY); location.hash = '#/login'; location.reload();
++}
+ 
+ async function api(path, { method = 'GET', body } = {}) {
+   const headers = { 'Content-Type': 'application/json' };
+diff --git a/frontend/js/app.js b/frontend/js/app.js
+index e2ae626..2f1f20b 100644
+--- a/frontend/js/app.js
++++ b/frontend/js/app.js
+@@ -49,7 +49,7 @@ const alertBox = (m) => `<div class="card err-box">${esc(m)}</div>`;
+ 
+ /* ---------- Layout y navegación ---------- */
+ const MENU = [
+-  ['/', 'Inicio', null], ['/usuarios', 'Usuarios y roles', ['Administrador']], ['/especialidades', 'Especialidades', ['Administrador']],
++  ['/', 'Inicio', null], ['/usuarios', 'Usuarios y roles', ['Administrador']], ['/bitacora', 'Bitácora', ['Administrador']], ['/especialidades', 'Especialidades', ['Administrador']],
+   ['/medicos', 'Médicos', ['Administrador']], ['/horarios', 'Horarios', ['Administrador']],
+   ['/pacientes', 'Pacientes', ['Administrador', 'Recepcionista']], ['/nueva-cita', 'Nueva cita', ['Administrador', 'Recepcionista', 'Paciente']],
+   ['/citas', 'Citas', null]
+@@ -157,7 +157,7 @@ R['/usuarios'] = { roles: ['Administrador'], async render() {
+   const [rows, roles] = await Promise.all([api('/api/usuarios'), api('/api/roles')]);
+   view.innerHTML = `<h2>Usuarios y roles</h2><div class="bar"><span class="sp"></span><button class="btn" id="nuevo">+ Nuevo usuario</button></div>
+     <div class="card tw"><table><thead><tr><th>Usuario</th><th>Nombre</th><th>Correo</th><th>Rol</th><th>Estado</th><th></th></tr></thead><tbody>
+-    ${rows.map(u => `<tr><td>${esc(u.username)}</td><td>${esc(u.nombre_completo)}</td><td>${esc(u.correo)}</td><td>${esc(u.rol)}</td><td>${onoff(u.estado)}</td><td class="act"><button class="btn sm ghost" data-e="${u.id_usuario}">Editar</button></td></tr>`).join('')}</tbody></table></div>`;
++    ${rows.map(u => `<tr><td>${esc(u.username)}</td><td>${esc(u.nombre_completo)}</td><td>${esc(u.correo)}</td><td>${esc(u.rol)}</td><td>${onoff(u.estado)}${u.bloqueado ? ' <span class="badge off" title="Bloqueado por intentos fallidos de ingreso">🔒 Bloqueado</span>' : ''}</td><td class="act"><button class="btn sm ghost" data-e="${u.id_usuario}">Editar</button>${u.bloqueado ? `<button class="btn sm" data-u="${u.id_usuario}" data-n="${esc(u.username)}">Desbloquear</button>` : ''}</td></tr>`).join('')}</tbody></table></div>`;
+   const form = (u = null) => modal(u ? 'Editar usuario' : 'Nuevo usuario', `<div class="grid">
+     ${fld('Nombre completo', 'nombre_completo', { value: u?.nombre_completo, req: true, attrs: 'maxlength="120"' })}
+     ${fld('Usuario', 'username', { value: u?.username, req: true, attrs: 'pattern="[A-Za-z0-9._\\-]{3,40}" title="3 a 40: letras, números . _ -"' })}
+@@ -168,6 +168,46 @@ R['/usuarios'] = { roles: ['Administrador'], async render() {
+     async d => { await api(u ? `/api/usuarios/${u.id_usuario}` : '/api/usuarios', { method: u ? 'PUT' : 'POST', body: d }); toast('Usuario guardado'); router(); });
+   $('#nuevo').onclick = () => form();
+   view.querySelectorAll('[data-e]').forEach(b => b.onclick = () => form(rows.find(r => r.id_usuario == b.dataset.e)));
++  view.querySelectorAll('[data-u]').forEach(b => b.onclick = async () => {
++    if (!confirm(`¿Desbloquear la cuenta «${b.dataset.n}»?`)) return;
++    try { await api(`/api/usuarios/${b.dataset.u}/desbloquear`, { method: 'POST' }); toast('Cuenta desbloqueada'); router(); } catch (e) { toast(e.message, 'err'); }
++  });
++} };
++
++/* ---------- Bitácora general (sólo administrador) ---------- */
++R['/bitacora'] = { roles: ['Administrador'], async render() {
++  const MODULOS = ['Sesión', 'Usuarios', 'Especialidades', 'Médicos', 'Horarios', 'Pacientes', 'Citas', 'Bitácora'];
++  view.innerHTML = `<h2>Bitácora general</h2>
++    <div class="bar"><input id="q" placeholder="Usuario, acción, detalle o IP"><select id="fm"><option value="">Todos los módulos</option>${MODULOS.map(m => `<option>${m}</option>`).join('')}</select>
++    <select id="fr"><option value="">Todos los resultados</option><option value="OK">Exitosos</option><option value="FALLIDO">Fallidos</option></select>
++    <input type="date" id="fd" title="Desde"><input type="date" id="fh" title="Hasta"><span class="sp"></span><button class="btn ghost" id="exp">Exportar CSV</button></div>
++    <div class="card tw" id="tb"></div><div class="bar" id="pg"></div>`;
++  let pagina = 1;
++  const filtros = () => ({ q: $('#q').value.trim(), modulo: $('#fm').value, resultado: $('#fr').value, desde: $('#fd').value, hasta: $('#fh').value });
++  const fstamp = d => d ? fdate(d) + ' ' + String(d).slice(11, 19) : '';
++  const load = async () => {
++    const r = await api('/api/bitacora' + qs({ ...filtros(), pagina, limite: 25 }));
++    pagina = r.pagina;
++    $('#tb').innerHTML = r.items.length ? `<table><thead><tr><th>Fecha y hora</th><th>Usuario</th><th>Módulo</th><th>Acción</th><th>Detalle</th><th>Resultado</th><th>IP</th></tr></thead><tbody>
++      ${r.items.map(i => `<tr><td style="white-space:nowrap">${fstamp(i.fecha_hora)}</td><td>${esc(i.usuario || '—')}${i.rol ? `<br><small class="muted">${esc(i.rol)}</small>` : ''}</td><td>${esc(i.modulo)}</td><td><code>${esc(i.accion)}</code></td><td>${esc(i.detalle)}</td>
++      <td><span class="badge ${i.resultado === 'OK' ? 'on' : 'off'}">${i.resultado === 'OK' ? 'Exitoso' : 'Fallido'}</span></td><td>${esc(i.ip)}</td></tr>`).join('')}</tbody></table>` : '<p class="muted">No hay registros con esos filtros.</p>';
++    $('#pg').innerHTML = `<span class="muted">${r.total} registro(s) · página ${r.pagina} de ${r.paginas}</span><span class="sp"></span>
++      <button class="btn sm ghost" id="pa" ${r.pagina <= 1 ? 'disabled' : ''}>← Anterior</button><button class="btn sm ghost" id="ps" ${r.pagina >= r.paginas ? 'disabled' : ''}>Siguiente →</button>`;
++    $('#pa').onclick = () => { pagina--; recargar(); }; $('#ps').onclick = () => { pagina++; recargar(); };
++  };
++  const recargar = async () => { try { await load(); } catch (e) { toast(e.message, 'err'); } };
++  const filtrar = () => { pagina = 1; recargar(); };
++  $('#q').oninput = debounce(filtrar); ['#fm', '#fr', '#fd', '#fh'].forEach(s => $(s).onchange = filtrar);
++  $('#exp').onclick = async () => {
++    try {
++      const res = await fetch(window.APP_CONFIG.API_URL + '/api/bitacora/exportar' + qs(filtros()), { headers: { Authorization: 'Bearer ' + sessionStorage.getItem(TOKEN_KEY) } });
++      if (!res.ok) { let m = 'No se pudo exportar'; try { m = (await res.json()).error || m; } catch { /* sin cuerpo */ } throw new Error(m); }
++      const url = URL.createObjectURL(await res.blob()); const a = document.createElement('a');
++      a.href = url; a.download = `bitacora-${today()}.csv`; document.body.append(a); a.click(); a.remove(); URL.revokeObjectURL(url);
++      toast('Bitácora exportada');
++    } catch (e) { toast(e.message, 'err'); }
++  };
++  await load();
+ } };
+ 
+ /* ---------- CU-04 Especialidades ---------- */
+diff --git a/render.yaml b/render.yaml
+index a790a47..75c55e0 100644
+--- a/render.yaml
++++ b/render.yaml
+@@ -25,6 +25,10 @@ services:
+         sync: false
+       - key: ALLOWED_ORIGINS
+         sync: false
++      - key: MAX_INTENTOS
++        value: "3"
++      - key: LOCKOUT_MINUTES
++        value: "0"
+   - type: web
+     name: vida-salud-web
+     runtime: static

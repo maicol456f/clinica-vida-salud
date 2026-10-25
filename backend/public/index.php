@@ -2,7 +2,7 @@
 declare(strict_types=1);
 require __DIR__ . '/../src/core.php';
 load_env(__DIR__ . '/../.env');
-foreach (['auth', 'admin', 'pacientes', 'citas'] as $c) require __DIR__ . "/../src/controllers/$c.php";
+foreach (['auth', 'admin', 'pacientes', 'citas', 'bitacora'] as $c) require __DIR__ . "/../src/controllers/$c.php";
 
 cors();
 
@@ -17,11 +17,15 @@ route('POST', '/api/auth/login', 'auth_login');
 route('POST', '/api/auth/register', 'auth_register');
 route('POST', '/api/auth/forgot', 'auth_forgot');
 route('POST', '/api/auth/reset', 'auth_reset');
+route('POST', '/api/auth/logout', 'auth_logout');
 route('GET', '/api/me', 'auth_me');
 route('GET', '/api/roles', 'roles_list');
 route('GET', '/api/usuarios', 'usuarios_list');
 route('POST', '/api/usuarios', fn() => usuarios_save());
 route('PUT', '/api/usuarios/{id}', 'usuarios_save');
+route('POST', '/api/usuarios/{id}/desbloquear', 'usuarios_desbloquear');
+route('GET', '/api/bitacora', 'bitacora_list');
+route('GET', '/api/bitacora/exportar', 'bitacora_exportar');
 route('GET', '/api/especialidades', 'especialidades_list');
 route('POST', '/api/especialidades', fn() => especialidades_save());
 route('PUT', '/api/especialidades/{id}', 'especialidades_save');

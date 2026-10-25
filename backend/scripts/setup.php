@@ -8,6 +8,8 @@ if (!$pdo->query("SELECT to_regclass('public.roles')")->fetchColumn()) {
     echo "Creando esquema de base de datos...\n";
     $pdo->exec(file_get_contents(__DIR__ . '/../sql/schema.sql'));
 }
+// Migraciones idempotentes (bitácora y bloqueo por intentos): corren en cada arranque, también en bases ya existentes
+$pdo->exec(file_get_contents(__DIR__ . '/../sql/bitacora_bloqueo.sql'));
 if ((int)$pdo->query('SELECT count(*) FROM roles')->fetchColumn() > 0) { echo "Base de datos lista.\n"; exit(0); }
 
 echo "Cargando datos iniciales...\n";

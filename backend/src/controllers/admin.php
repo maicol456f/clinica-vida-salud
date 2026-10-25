@@ -6,11 +6,11 @@ function roles_list(): void { require_login(); json_out(db()->query('SELECT id_r
 /* ---------- CU-03 ---------- */
 function usuarios_list(): void {
     require_role('Administrador');
-    json_out(db()->query('SELECT u.id_usuario, u.nombre_completo, u.username, u.correo, u.estado, u.id_rol, r.nombre AS rol, u.creado_en
+    json_out(db()->query('SELECT u.id_usuario, u.nombre_completo, u.username, u.correo, u.estado, u.bloqueado, u.intentos_fallidos, u.id_rol, r.nombre AS rol, u.creado_en
         FROM usuarios u JOIN roles r ON r.id_rol = u.id_rol ORDER BY u.id_usuario')->fetchAll());
 }
 function usuarios_save(int $id = 0): void {
-    require_role('Administrador'); $b = body();
+    $adm = require_role('Administrador'); $b = body();
     need($b, ['nombre_completo' => 'Nombre completo', 'username' => 'Usuario', 'correo' => 'Correo', 'id_rol' => 'Rol']);
     $nombre = str($b, 'nombre_completo', 120); $user = str($b, 'username', 40); $mail = strtolower(str($b, 'correo', 120));
     $rol = (int)$b['id_rol']; $estado = pgb($b['estado'] ?? true); $pw = (string)($b['password'] ?? '');
@@ -19,12 +19,13 @@ function usuarios_save(int $id = 0): void {
     if ($id === 0 && !valid_password($pw)) fail('La contraseña inicial debe tener al menos 8 caracteres, con letras y números', 422);
     if ($id > 0 && $pw !== '' && !valid_password($pw)) fail('La contraseña debe tener al menos 8 caracteres, con letras y números', 422);
     $pdo = db();
-    $c = $pdo->prepare('SELECT 1 FROM roles WHERE id_rol = ?'); $c->execute([$rol]); if (!$c->fetch()) fail('El rol no existe', 422);
+    $c = $pdo->prepare('SELECT nombre FROM roles WHERE id_rol = ?'); $c->execute([$rol]); $rolNombre = $c->fetchColumn(); if ($rolNombre === false) fail('El rol no existe', 422);
     $c = $pdo->prepare('SELECT 1 FROM usuarios WHERE (lower(username) = lower(?) OR lower(correo) = ?) AND id_usuario <> ?'); $c->execute([$user, $mail, $id]);
     if ($c->fetch()) fail('El nombre de usuario o el correo ya existen', 409);
     if ($id === 0) {
         $pdo->prepare('INSERT INTO usuarios(id_rol, nombre_completo, username, correo, password_hash, estado) VALUES (?,?,?,?,?,?::boolean)')
             ->execute([$rol, $nombre, $user, $mail, password_hash($pw, PASSWORD_DEFAULT), $estado]);
+        bitacora('Usuarios', 'USUARIO_CREADO', "Creó el usuario «{$user}» con rol $rolNombre", $adm);
         json_out(['mensaje' => 'Usuario creado'], 201);
     }
     $c = $pdo->prepare("SELECT u.estado, r.nombre AS rol FROM usuarios u JOIN roles r ON r.id_rol = u.id_rol WHERE u.id_usuario = ?"); $c->execute([$id]);
@@ -37,7 +38,17 @@ function usuarios_save(int $id = 0): void {
     $pdo->prepare('UPDATE usuarios SET id_rol = ?, nombre_completo = ?, username = ?, correo = ?, estado = ?::boolean WHERE id_usuario = ?')
         ->execute([$rol, $nombre, $user, $mail, $estado, $id]);
     if ($pw !== '') $pdo->prepare('UPDATE usuarios SET password_hash = ? WHERE id_usuario = ?')->execute([password_hash($pw, PASSWORD_DEFAULT), $id]);
+    bitacora('Usuarios', 'USUARIO_ACTUALIZADO', "Actualizó el usuario «{$user}» (rol $rolNombre, " . ($estado === 'true' ? 'activo' : 'inactivo') . ')' . ($pw !== '' ? ', cambió su contraseña' : ''), $adm);
     json_out(['mensaje' => 'Usuario actualizado']);
+}
+
+/** El administrador levanta el bloqueo por intentos fallidos de una cuenta. */
+function usuarios_desbloquear(int $id): void {
+    $adm = require_role('Administrador');
+    $nombre = desbloquear_cuenta($id);
+    if ($nombre === null) fail('El usuario no existe', 404);
+    bitacora('Usuarios', 'USUARIO_DESBLOQUEADO', "Desbloqueó la cuenta «{$nombre}»", $adm);
+    json_out(['mensaje' => 'Cuenta desbloqueada']);
 }
 
 /* ---------- CU-04 ---------- */
@@ -49,7 +60,7 @@ function especialidades_list(): void {
         FROM especialidades e $w ORDER BY e.nombre")->fetchAll());
 }
 function especialidades_save(int $id = 0): void {
-    require_role('Administrador'); $b = body();
+    $adm = require_role('Administrador'); $b = body();
     need($b, ['nombre' => 'Nombre']);
     $nombre = str($b, 'nombre', 80); $desc = str($b, 'descripcion', 200); $estado = pgb($b['estado'] ?? true); $norm = normalizar($nombre);
     $pdo = db();
@@ -57,6 +68,7 @@ function especialidades_save(int $id = 0): void {
     if ($c->fetch()) fail('Ya existe una especialidad con ese nombre', 409);
     if ($id === 0) {
         $pdo->prepare('INSERT INTO especialidades(nombre, nombre_normalizado, descripcion, estado) VALUES (?,?,?,?::boolean)')->execute([$nombre, $norm, $desc ?: null, $estado]);
+        bitacora('Especialidades', 'ESPECIALIDAD_CREADA', "Creó la especialidad «{$nombre}»", $adm);
         json_out(['mensaje' => 'Especialidad creada'], 201);
     }
     if ($estado === 'false' && empty($b['confirmar'])) {
@@ -66,6 +78,7 @@ function especialidades_save(int $id = 0): void {
     $u = $pdo->prepare('UPDATE especialidades SET nombre = ?, nombre_normalizado = ?, descripcion = ?, estado = ?::boolean WHERE id_especialidad = ?');
     $u->execute([$nombre, $norm, $desc ?: null, $estado, $id]);
     if (!$u->rowCount()) fail('La especialidad no existe', 404);
+    bitacora('Especialidades', 'ESPECIALIDAD_ACTUALIZADA', "Actualizó la especialidad «{$nombre}» (" . ($estado === 'true' ? 'activa' : 'inactiva') . ')', $adm);
     json_out(['mensaje' => 'Especialidad actualizada']);
 }
 
@@ -93,7 +106,7 @@ function medicos_list(): void {
     json_out($rows);
 }
 function medicos_save(int $id = 0): void {
-    require_role('Administrador'); $b = body();
+    $adm = require_role('Administrador'); $b = body(); $esNuevo = $id === 0;
     need($b, ['nro_registro' => 'Nro. de registro profesional', 'nombres' => 'Nombres', 'apellidos' => 'Apellidos', 'correo' => 'Correo']);
     $reg = str($b, 'nro_registro', 30); $no = str($b, 'nombres', 80); $ap = str($b, 'apellidos', 80); $tel = str($b, 'telefono', 20);
     $mail = strtolower(str($b, 'correo', 120)); $estado = pgb($b['estado'] ?? true);
@@ -131,6 +144,7 @@ function medicos_save(int $id = 0): void {
         }
         foreach ($esps as $e) $pdo->prepare('INSERT INTO medico_especialidad(id_medico, id_especialidad) VALUES (?,?)')->execute([$id, $e]);
     });
+    bitacora('Médicos', $esNuevo ? 'MEDICO_CREADO' : 'MEDICO_ACTUALIZADO', ($esNuevo ? 'Registró' : 'Actualizó') . " al médico $no $ap (registro $reg)", $adm);
     json_out(['mensaje' => 'Médico guardado'], 201);
 }
 
@@ -147,7 +161,7 @@ function horario_conflicto(int $medico, int $dia, string $ini, string $fin, int 
     $st->execute([$medico, $dia, $fin, $ini, $excluir]); return (bool)$st->fetch();
 }
 function horarios_create(): void {
-    require_role('Administrador'); $b = body();
+    $adm = require_role('Administrador'); $b = body();
     need($b, ['id_medico' => 'Médico', 'dia_semana' => 'Día', 'hora_inicio' => 'Hora inicial', 'hora_fin' => 'Hora final', 'duracion_min' => 'Duración']);
     $m = (int)$b['id_medico']; $dia = (int)$b['dia_semana']; $ini = str($b, 'hora_inicio', 8); $fin = str($b, 'hora_fin', 8); $dur = (int)$b['duracion_min'];
     if ($dia < 1 || $dia > 7) fail('Día inválido', 422);
@@ -160,14 +174,16 @@ function horarios_create(): void {
     if (horario_conflicto($m, $dia, $ini, $fin)) fail('El horario se superpone con otro ya registrado para ese día', 409);
     db()->prepare('INSERT INTO horarios_atencion(id_medico, dia_semana, hora_inicio, hora_fin, duracion_min) VALUES (?,?,?::time,?::time,?)')->execute([$m, $dia, $ini, $fin, $dur]);
     $cupos = intdiv((strtotime($fin) - strtotime($ini)) / 60, $dur);
+    bitacora('Horarios', 'HORARIO_CREADO', "Médico #$m: " . ['', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo'][$dia] . " de $ini a $fin, $dur min por cita", $adm);
     json_out(['mensaje' => "Horario guardado: $cupos cupos por jornada"], 201);
 }
 function horarios_estado(int $id): void {
-    require_role('Administrador'); $estado = pgb(body()['estado'] ?? false);
+    $adm = require_role('Administrador'); $estado = pgb(body()['estado'] ?? false);
     $st = db()->prepare('SELECT * FROM horarios_atencion WHERE id_horario = ?'); $st->execute([$id]); $h = $st->fetch();
     if (!$h) fail('El horario no existe', 404);
     if ($estado === 'true' && horario_conflicto((int)$h['id_medico'], (int)$h['dia_semana'], $h['hora_inicio'], $h['hora_fin'], $id))
         fail('No se puede reactivar: se superpone con otro horario vigente', 409);
     db()->prepare('UPDATE horarios_atencion SET estado = ?::boolean WHERE id_horario = ?')->execute([$estado, $id]);
+    bitacora('Horarios', $estado === 'true' ? 'HORARIO_ACTIVADO' : 'HORARIO_DESACTIVADO', "Horario #$id del médico #{$h['id_medico']} " . ($estado === 'true' ? 'activado' : 'desactivado'), $adm);
     json_out(['mensaje' => 'Horario actualizado']);
 }

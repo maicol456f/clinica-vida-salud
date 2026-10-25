@@ -1,5 +1,16 @@
 const TOKEN_KEY = 'vs_token';
-function logout() { sessionStorage.removeItem(TOKEN_KEY); location.hash = '#/login'; location.reload(); }
+async function logout() {
+  const t = sessionStorage.getItem(TOKEN_KEY);
+  if (t) {   // avisa al servidor para registrar el cierre en la bitácora (máx. 1,5 s de espera)
+    try {
+      await Promise.race([
+        fetch(window.APP_CONFIG.API_URL + '/api/auth/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + t } }).catch(() => {}),
+        new Promise(r => setTimeout(r, 1500))
+      ]);
+    } catch { /* se cierra la sesión igualmente */ }
+  }
+  sessionStorage.removeItem(TOKEN_KEY); location.hash = '#/login'; location.reload();
+}
 
 async function api(path, { method = 'GET', body } = {}) {
   const headers = { 'Content-Type': 'application/json' };

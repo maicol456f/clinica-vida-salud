@@ -69,7 +69,9 @@ function citas_create(): void {
         return $st->fetchColumn();
     });
     $st = db()->prepare(CITA_SQL . ' WHERE c.codigo = ?'); $st->execute([$codigo]);
-    json_out($st->fetch(), 201);
+    $cita = $st->fetch();
+    bitacora('Citas', 'CITA_CREADA', "Cita $codigo programada para $f $h con {$cita['medico']} (paciente {$cita['paciente_codigo']})", $u);
+    json_out($cita, 201);
 }
 
 function cita_autorizada(int $id): array {
@@ -104,6 +106,7 @@ function citas_reprogramar(int $id): void {
             ->execute([$id, $c['estado'], $c['estado'], $u['id_usuario'], $obs]);
         return cita_row($id);
     });
+    bitacora('Citas', 'CITA_REPROGRAMADA', "Cita {$res['codigo']} reprogramada a $f $h" . ($motivo ? ": $motivo" : ''), $u);
     json_out($res);
 }
 
@@ -122,5 +125,6 @@ function citas_cancelar(int $id): void {
         $pdo->prepare('UPDATE cita_historial SET id_usuario = ? WHERE id_historial = (SELECT max(id_historial) FROM cita_historial WHERE id_cita = ?)')->execute([$u['id_usuario'], $id]);
         return cita_row($id);
     });
+    bitacora('Citas', 'CITA_CANCELADA', "Cita {$res['codigo']} cancelada. Motivo: $motivo", $u);
     json_out($res);
 }

@@ -44,3 +44,12 @@ Defina `SEED_DEMO=0` para cargar sólo el administrador (clave en `ADMIN_PASSWOR
 Contraseñas con `password_hash`, token firmado con expiración, consultas parametrizadas (PDO), validación en cliente y servidor,
 escape de salida contra XSS, control de acceso por rol, errores sin detalles internos, CORS restringido (`ALLOWED_ORIGINS`),
 y prevención de citas superpuestas con validación en servidor + transacción + restricción `EXCLUDE` de PostgreSQL.
+
+## Bitácora general y bloqueo por intentos fallidos
+**Bloqueo de cuenta.** Tras `MAX_INTENTOS` (3) contraseñas incorrectas consecutivas la cuenta queda bloqueada y responde `423`. Un ingreso correcto reinicia el contador.
+Se desbloquea desde *Usuarios y roles → Desbloquear* (administrador), o cuando el usuario restablece su contraseña por correo.
+Con `LOCKOUT_MINUTES` mayor que 0 el bloqueo se levanta solo pasado ese tiempo (0 = sólo manual). Rescate por consola: `php scripts/desbloquear.php admin`.
+
+**Bitácora.** Tabla `bitacora` de sólo inserción (un trigger impide modificarla o borrarla). Registra inicio y cierre de sesión, intentos fallidos, bloqueos,
+recuperación de contraseña y las altas/cambios de usuarios, especialidades, médicos, horarios, pacientes y citas, con usuario, rol, IP, detalle y resultado.
+Pantalla *Bitácora* (sólo administrador) con filtros, paginación y exportación a CSV. La migración `sql/bitacora_bloqueo.sql` es idempotente y corre en cada arranque.

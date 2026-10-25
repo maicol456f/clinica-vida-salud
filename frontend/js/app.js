@@ -49,7 +49,7 @@ const alertBox = (m) => `<div class="card err-box">${esc(m)}</div>`;
 
 /* ---------- Layout y navegación ---------- */
 const MENU = [
-  ['/', 'Inicio', null], ['/usuarios', 'Usuarios y roles', ['Administrador']], ['/especialidades', 'Especialidades', ['Administrador']],
+  ['/', 'Inicio', null], ['/usuarios', 'Usuarios y roles', ['Administrador']], ['/bitacora', 'Bitácora', ['Administrador']], ['/especialidades', 'Especialidades', ['Administrador']],
   ['/medicos', 'Médicos', ['Administrador']], ['/horarios', 'Horarios', ['Administrador']],
   ['/pacientes', 'Pacientes', ['Administrador', 'Recepcionista']], ['/nueva-cita', 'Nueva cita', ['Administrador', 'Recepcionista', 'Paciente']],
   ['/citas', 'Citas', null]
@@ -157,7 +157,7 @@ R['/usuarios'] = { roles: ['Administrador'], async render() {
   const [rows, roles] = await Promise.all([api('/api/usuarios'), api('/api/roles')]);
   view.innerHTML = `<h2>Usuarios y roles</h2><div class="bar"><span class="sp"></span><button class="btn" id="nuevo">+ Nuevo usuario</button></div>
     <div class="card tw"><table><thead><tr><th>Usuario</th><th>Nombre</th><th>Correo</th><th>Rol</th><th>Estado</th><th></th></tr></thead><tbody>
-    ${rows.map(u => `<tr><td>${esc(u.username)}</td><td>${esc(u.nombre_completo)}</td><td>${esc(u.correo)}</td><td>${esc(u.rol)}</td><td>${onoff(u.estado)}</td><td class="act"><button class="btn sm ghost" data-e="${u.id_usuario}">Editar</button></td></tr>`).join('')}</tbody></table></div>`;
+    ${rows.map(u => `<tr><td>${esc(u.username)}</td><td>${esc(u.nombre_completo)}</td><td>${esc(u.correo)}</td><td>${esc(u.rol)}</td><td>${onoff(u.estado)}${u.bloqueado ? ' <span class="badge off" title="Bloqueado por intentos fallidos de ingreso">🔒 Bloqueado</span>' : ''}</td><td class="act"><button class="btn sm ghost" data-e="${u.id_usuario}">Editar</button>${u.bloqueado ? `<button class="btn sm" data-u="${u.id_usuario}" data-n="${esc(u.username)}">Desbloquear</button>` : ''}</td></tr>`).join('')}</tbody></table></div>`;
   const form = (u = null) => modal(u ? 'Editar usuario' : 'Nuevo usuario', `<div class="grid">
     ${fld('Nombre completo', 'nombre_completo', { value: u?.nombre_completo, req: true, attrs: 'maxlength="120"' })}
     ${fld('Usuario', 'username', { value: u?.username, req: true, attrs: 'pattern="[A-Za-z0-9._\\-]{3,40}" title="3 a 40: letras, números . _ -"' })}
@@ -168,6 +168,46 @@ R['/usuarios'] = { roles: ['Administrador'], async render() {
     async d => { await api(u ? `/api/usuarios/${u.id_usuario}` : '/api/usuarios', { method: u ? 'PUT' : 'POST', body: d }); toast('Usuario guardado'); router(); });
   $('#nuevo').onclick = () => form();
   view.querySelectorAll('[data-e]').forEach(b => b.onclick = () => form(rows.find(r => r.id_usuario == b.dataset.e)));
+  view.querySelectorAll('[data-u]').forEach(b => b.onclick = async () => {
+    if (!confirm(`¿Desbloquear la cuenta «${b.dataset.n}»?`)) return;
+    try { await api(`/api/usuarios/${b.dataset.u}/desbloquear`, { method: 'POST' }); toast('Cuenta desbloqueada'); router(); } catch (e) { toast(e.message, 'err'); }
+  });
+} };
+
+/* ---------- Bitácora general (sólo administrador) ---------- */
+R['/bitacora'] = { roles: ['Administrador'], async render() {
+  const MODULOS = ['Sesión', 'Usuarios', 'Especialidades', 'Médicos', 'Horarios', 'Pacientes', 'Citas', 'Bitácora'];
+  view.innerHTML = `<h2>Bitácora general</h2>
+    <div class="bar"><input id="q" placeholder="Usuario, acción, detalle o IP"><select id="fm"><option value="">Todos los módulos</option>${MODULOS.map(m => `<option>${m}</option>`).join('')}</select>
+    <select id="fr"><option value="">Todos los resultados</option><option value="OK">Exitosos</option><option value="FALLIDO">Fallidos</option></select>
+    <input type="date" id="fd" title="Desde"><input type="date" id="fh" title="Hasta"><span class="sp"></span><button class="btn ghost" id="exp">Exportar CSV</button></div>
+    <div class="card tw" id="tb"></div><div class="bar" id="pg"></div>`;
+  let pagina = 1;
+  const filtros = () => ({ q: $('#q').value.trim(), modulo: $('#fm').value, resultado: $('#fr').value, desde: $('#fd').value, hasta: $('#fh').value });
+  const fstamp = d => d ? fdate(d) + ' ' + String(d).slice(11, 19) : '';
+  const load = async () => {
+    const r = await api('/api/bitacora' + qs({ ...filtros(), pagina, limite: 25 }));
+    pagina = r.pagina;
+    $('#tb').innerHTML = r.items.length ? `<table><thead><tr><th>Fecha y hora</th><th>Usuario</th><th>Módulo</th><th>Acción</th><th>Detalle</th><th>Resultado</th><th>IP</th></tr></thead><tbody>
+      ${r.items.map(i => `<tr><td style="white-space:nowrap">${fstamp(i.fecha_hora)}</td><td>${esc(i.usuario || '—')}${i.rol ? `<br><small class="muted">${esc(i.rol)}</small>` : ''}</td><td>${esc(i.modulo)}</td><td><code>${esc(i.accion)}</code></td><td>${esc(i.detalle)}</td>
+      <td><span class="badge ${i.resultado === 'OK' ? 'on' : 'off'}">${i.resultado === 'OK' ? 'Exitoso' : 'Fallido'}</span></td><td>${esc(i.ip)}</td></tr>`).join('')}</tbody></table>` : '<p class="muted">No hay registros con esos filtros.</p>';
+    $('#pg').innerHTML = `<span class="muted">${r.total} registro(s) · página ${r.pagina} de ${r.paginas}</span><span class="sp"></span>
+      <button class="btn sm ghost" id="pa" ${r.pagina <= 1 ? 'disabled' : ''}>← Anterior</button><button class="btn sm ghost" id="ps" ${r.pagina >= r.paginas ? 'disabled' : ''}>Siguiente →</button>`;
+    $('#pa').onclick = () => { pagina--; recargar(); }; $('#ps').onclick = () => { pagina++; recargar(); };
+  };
+  const recargar = async () => { try { await load(); } catch (e) { toast(e.message, 'err'); } };
+  const filtrar = () => { pagina = 1; recargar(); };
+  $('#q').oninput = debounce(filtrar); ['#fm', '#fr', '#fd', '#fh'].forEach(s => $(s).onchange = filtrar);
+  $('#exp').onclick = async () => {
+    try {
+      const res = await fetch(window.APP_CONFIG.API_URL + '/api/bitacora/exportar' + qs(filtros()), { headers: { Authorization: 'Bearer ' + sessionStorage.getItem(TOKEN_KEY) } });
+      if (!res.ok) { let m = 'No se pudo exportar'; try { m = (await res.json()).error || m; } catch { /* sin cuerpo */ } throw new Error(m); }
+      const url = URL.createObjectURL(await res.blob()); const a = document.createElement('a');
+      a.href = url; a.download = `bitacora-${today()}.csv`; document.body.append(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+      toast('Bitácora exportada');
+    } catch (e) { toast(e.message, 'err'); }
+  };
+  await load();
 } };
 
 /* ---------- CU-04 Especialidades ---------- */

@@ -70,7 +70,7 @@ function str(array $a, string $k, int $max = 200): string {
 }
 function need(array $a, array $labels): void {
     foreach ($labels as $k => $label) if (!isset($a[$k]) || (is_scalar($a[$k]) && trim((string)$a[$k]) === ''))
-        fail("El campo «$label» es obligatorio", 422);
+        fail("El campo «{$label}» es obligatorio", 422);
 }
 
 /* ---------- Validaciones (servidor) ---------- */
@@ -128,6 +128,31 @@ function require_role(string ...$roles): array {
     $u = require_login();
     if (!in_array($u['rol'], $roles, true)) fail('No tiene permiso para esta operación', 403);
     return $u;
+}
+
+/* ---------- Bitácora general ---------- */
+/** Registra un evento. $actor = ['id_usuario' =>, 'username' =>, 'rol' =>] (todo opcional). Nunca interrumpe la operación principal. */
+function bitacora(string $modulo, string $accion, string $detalle = '', ?array $actor = null, string $resultado = 'OK'): void {
+    try {
+        $xff = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? '';   // en Render la IP real llega en este encabezado
+        $ip = $xff !== '' ? trim(explode(',', $xff)[0]) : ($_SERVER['REMOTE_ADDR'] ?? '');
+        $nombre = $actor['username'] ?? null;
+        db()->prepare('INSERT INTO bitacora(id_usuario, usuario, rol, modulo, accion, detalle, resultado, ip) VALUES (?,?,?,?,?,?,?,?)')->execute([
+            $actor['id_usuario'] ?? null, $nombre !== null ? mb_substr((string)$nombre, 0, 120) : null, $actor['rol'] ?? null,
+            $modulo, $accion, $detalle !== '' ? mb_substr($detalle, 0, 500) : null, $resultado, $ip !== '' ? mb_substr($ip, 0, 64) : null,
+        ]);
+    } catch (Throwable $e) { error_log('Bitácora: ' . $e->getMessage()); }
+}
+
+/* ---------- Bloqueo por intentos fallidos ---------- */
+function max_intentos(): int { return max(1, (int)env('MAX_INTENTOS', '3')); }
+/** 0 = el bloqueo dura hasta que un administrador (o la recuperación de contraseña) lo levante. */
+function minutos_bloqueo(): int { return max(0, (int)env('LOCKOUT_MINUTES', '0')); }
+/** Quita el bloqueo y reinicia el contador. Devuelve el username, o null si el usuario no existe. */
+function desbloquear_cuenta(int $id): ?string {
+    $st = db()->prepare('UPDATE usuarios SET bloqueado = false, intentos_fallidos = 0, bloqueado_en = NULL WHERE id_usuario = ? RETURNING username');
+    $st->execute([$id]); $n = $st->fetchColumn();
+    return $n === false ? null : (string)$n;
 }
 
 /* ---------- CORS ---------- */
